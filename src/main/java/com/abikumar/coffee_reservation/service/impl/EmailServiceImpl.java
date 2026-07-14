@@ -4,17 +4,24 @@ import com.abikumar.coffee_reservation.entity.Reservation;
 import com.abikumar.coffee_reservation.service.EmailService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.mail.SimpleMailMessage;
-import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
 
 import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Map;
 
 /**
- * Talking to the SMTP server (Gmail) can take a few seconds per email. Every method
- * here is {@link Async} so the calling request (send-otp, approve, reject) can respond
- * to the browser immediately instead of making the user wait for the mail round-trip.
+ * Railway blocks outbound SMTP (ports 587 and 465 both time out), so instead of talking
+ * to Gmail's SMTP server directly, we send mail through Brevo's HTTPS API (port 443,
+ * never blocked). Every method here is {@link Async} so the calling request (send-otp,
+ * approve, reject) can respond to the browser immediately instead of waiting on the
+ * mail round-trip.
  */
 @Service
 public class EmailServiceImpl implements EmailService {
@@ -24,11 +31,18 @@ public class EmailServiceImpl implements EmailService {
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("dd MMM yyyy");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("hh:mm a");
 
-    private final JavaMailSender javaMailSender;
+    private static final String BREVO_API_URL = "https://api.brevo.com/v3/smtp/email";
 
-    public EmailServiceImpl(JavaMailSender javaMailSender) {
-        this.javaMailSender = javaMailSender;
-    }
+    private final RestTemplate restTemplate = new RestTemplate();
+
+    @Value("${brevo.api.key}")
+    private String brevoApiKey;
+
+    @Value("${brevo.sender.email}")
+    private String senderEmail;
+
+    @Value("${brevo.sender.name:Roasthouse}")
+    private String senderName;
 
     @Override
     @Async
@@ -66,15 +80,24 @@ public class EmailServiceImpl implements EmailService {
 
     private void sendMail(String toEmail, String subject, String body) {
         try {
-            SimpleMailMessage message = new SimpleMailMessage();
-            message.setTo(toEmail);
-            message.setSubject(subject);
-            message.setText(body);
-            javaMailSender.send(message);
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("api-key", brevoApiKey);
+            headers.set("accept", "application/json");
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, Object> payload = Map.of(
+                    "sender", Map.of("name", senderName, "email", senderEmail),
+                    "to", List.of(Map.of("email", toEmail)),
+                    "subject", subject,
+                    "textContent", body
+            );
+
+            HttpEntity<Map<String, Object>> request = new HttpEntity<>(payload, headers);
+            restTemplate.postForEntity(BREVO_API_URL, request, String.class);
             log.info("Email sent to={} subject='{}'", toEmail, subject);
         } catch (Exception ex) {
             // Email delivery failure should not break the calling flow (e.g. reservation
-            // approval must still succeed even if the mail server is temporarily down).
+            // approval must still succeed even if the mail provider is temporarily down).
             log.error("Failed to send email to={} subject='{}'", toEmail, subject, ex);
         }
     }
